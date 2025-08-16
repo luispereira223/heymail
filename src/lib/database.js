@@ -78,11 +78,13 @@ export function initializeDatabase() {
     
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     
-    FOREIGN KEY (account_id) REFERENCES email_accounts (id) ON DELETE CASCADE,
-    INDEX idx_account_uid (account_id, uid),
-    INDEX idx_account_date (account_id, internal_date),
-    INDEX idx_thread (account_id, thread_id)
+    FOREIGN KEY (account_id) REFERENCES email_accounts (id) ON DELETE CASCADE
   )`);
+  
+  // Create indexes separately (this was the issue!)
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_account_uid ON emails (account_id, uid)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_account_date ON emails (account_id, internal_date)`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_thread ON emails (account_id, thread_id)`);
   
   // Updated attachments table
   db.exec(`CREATE TABLE IF NOT EXISTS attachments (
@@ -150,20 +152,55 @@ export const EMAIL_PROVIDERS = {
   }
 };
 
-// Simple encryption helpers (in production, use proper encryption)
+// Encryption helpers using modern crypto methods
 const crypto = require('crypto');
-const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'your-default-encryption-key-change-this-in-production';
+
+// Ensure the key is exactly 32 bytes for AES-256
+function getEncryptionKey() {
+  const key = crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
+  return key;
+}
 
 export function encryptPassword(password) {
-  const cipher = crypto.createCipher('aes-256-cbc', ENCRYPTION_KEY);
-  let encrypted = cipher.update(password, 'utf8', 'hex');
-  encrypted += cipher.final('hex');
-  return encrypted;
+  try {
+    const algorithm = 'aes-256-cbc';
+    const key = getEncryptionKey();
+    const iv = crypto.randomBytes(16); // Generate random IV
+    
+    const cipher = crypto.createCipheriv(algorithm, key, iv);
+    let encrypted = cipher.update(password, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    
+    // Prepend IV to encrypted data (IV:encrypted)
+    return iv.toString('hex') + ':' + encrypted;
+  } catch (error) {
+    console.error('Encryption error:', error);
+    throw new Error('Failed to encrypt password');
+  }
 }
 
 export function decryptPassword(encryptedPassword) {
-  const decipher = crypto.createDecipher('aes-256-cbc', ENCRYPTION_KEY);
-  let decrypted = decipher.update(encryptedPassword, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
-  return decrypted;
+  try {
+    const algorithm = 'aes-256-cbc';
+    const key = getEncryptionKey();
+    
+    // Split IV and encrypted data
+    const parts = encryptedPassword.split(':');
+    if (parts.length !== 2) {
+      throw new Error('Invalid encrypted data format');
+    }
+    
+    const iv = Buffer.from(parts[0], 'hex');
+    const encrypted = parts[1];
+    
+    const decipher = crypto.createDecipheriv(algorithm, key, iv);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    
+    return decrypted;
+  } catch (error) {
+    console.error('Decryption error:', error);
+    throw new Error('Failed to decrypt password');
+  }
 }

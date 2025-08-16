@@ -77,10 +77,7 @@ export default function Home() {
       setDialog({ show: true, message: "Passwords do not match!", type: "error" });
       return;
     }
-    if (!signupData.agreeToTerms) {
-      setDialog({ show: true, message: "Please agree to the terms.", type: "error" });
-      return;
-    }
+
 
     try {
       const response = await fetch("/api/register", {

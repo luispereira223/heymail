@@ -3,6 +3,8 @@ import Credentials from "next-auth/providers/credentials";
 import { initializeDatabase } from "@/lib/database";
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
+  secret: process.env.AUTH_SECRET, // Explicitly set the secret
+  
   providers: [
     Credentials({
       credentials: {
@@ -17,9 +19,11 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
         }
 
         // Open DB
-        const db = initializeDatabase();
-
+        let db;
+        
         try {
+          db = initializeDatabase();
+
           // Find user by email
           const getUser = db.prepare("SELECT id, email, password, name FROM users WHERE email = ?");
           const userRow = getUser.get(credentials.email);
@@ -46,8 +50,13 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
           console.log("Authentication successful for user:", user.email);
           return user;
 
+        } catch (error) {
+          console.error("Authorization error:", error);
+          throw error;
         } finally {
-          db.close();
+          if (db) {
+            db.close();
+          }
         }
       },
     }),
