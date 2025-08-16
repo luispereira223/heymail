@@ -1,5 +1,6 @@
 import NextAuth from "next-auth";
 import Credentials from "next-auth/providers/credentials";
+import { initializeDatabase } from "@/lib/database";
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
   providers: [
@@ -10,47 +11,75 @@ export const { handlers, signIn, signOut, auth } = NextAuth({
       },
 
       authorize: async (credentials) => {
-        // basic guard
+        // Basic guard
         if (!credentials?.email || !credentials?.password) {
           throw new Error("Missing credentials.");
         }
 
-        // open DB (better-sqlite3)
-        const Database = require("better-sqlite3");
-        const db = Database("emails.db");
+        // Open DB
+        const db = initializeDatabase();
 
-        // find user by email
-        const getUser = db.prepare("SELECT * FROM users WHERE email = ?");
-        const userRow = getUser.get(credentials.email);
+        try {
+          // Find user by email
+          const getUser = db.prepare("SELECT id, email, password, name FROM users WHERE email = ?");
+          const userRow = getUser.get(credentials.email);
 
-        if (!userRow) {
-          // no user with that email
-          throw new Error("Invalid credentials.");
+          if (!userRow) {
+            throw new Error("Invalid credentials.");
+          }
+
+          // Verify password with argon2
+          const argon2 = require("argon2");
+          const isValid = await argon2.verify(userRow.password, credentials.password);
+
+          if (!isValid) {
+            throw new Error("Invalid credentials.");
+          }
+
+          // SUCCESS — return user object
+          const user = {
+            id: userRow.id.toString(),
+            email: userRow.email,
+            name: userRow.name,
+          };
+
+          console.log("Authentication successful for user:", user.email);
+          return user;
+
+        } finally {
+          db.close();
         }
-
-        // verify password with argon2
-        const argon2 = require("argon2");
-        const isValid = await argon2.verify(userRow.password, credentials.password);
-
-        if (!isValid) {
-          // wrong password
-          throw new Error("Invalid credentials.");
-        }
-
-        // SUCCESS — return a non-null user object (no id/email returned)
-        const user = {
-          name: userRow.full_name || "User",
-          // you can add other non-sensitive flags here if needed, e.g. role
-          // role: userRow.role || 'user',
-        };
-
-        console.log("authorize: returning user =>", user);
-        return user;
       },
     }),
   ],
 
-  // Note: intentionally no callbacks, no session/jwt customization — simple setup
+  session: {
+    strategy: "jwt",
+  },
+
+  callbacks: {
+    async jwt({ token, user }) {
+      if (user) {
+        token.id = user.id;
+        token.email = user.email;
+        token.name = user.name;
+      }
+      return token;
+    },
+
+    async session({ session, token }) {
+      if (token) {
+        session.user.id = token.id;
+        session.user.email = token.email;
+        session.user.name = token.name;
+      }
+      return session;
+    },
+  },
+
+  pages: {
+    signIn: "/", // Redirect to home page for sign in
+  },
 });
 
 export const { POST, GET } = handlers;

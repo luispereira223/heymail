@@ -6,7 +6,9 @@
     "dev": "next dev --turbopack",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "init-db": "node src/lib/init-db.js",
+    "reset-db": "rm -f emails.db && npm run init-db"
   },
   "dependencies": {
     "argon2": "^0.44.0",
@@ -23,4 +25,10 @@
     "@tailwindcss/postcss": "^4",
     "tailwindcss": "^4"
   }
+
+ 
+
+
+
+
 }
