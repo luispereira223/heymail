@@ -2,11 +2,11 @@
 "use client";
 import { useSession, signOut } from "next-auth/react";
 import { useState, useEffect } from "react";
-import DashboardHeader from "./components/DashboardHeader";
-import EmailAccountsSection from "./components/EmailAccountsSection";
-import EmailsSection from "./components/EmailsSection";
-import FirstTimeUserSetup from "./components/FirstTimeUserSetup";
-import AddEmailAccountForm from "./components/AddEmailAccountForm";
+import DashboardHeader from "../components/DashboardHeader";
+import EmailAccountsSection from "../components/EmailAccountsSection";
+import EmailsSection from "../components/EmailSection"; // Note: file is EmailSection.js, not EmailsSection.js
+import FirstTimeUserSetup from "../components/FirstTImeUserSetup"; // Note: file has typo in name
+import AddEmailAccountForm from "../components/AddEmailAccountForm";
 
 export default function Dashboard() {
   const [emails, setEmails] = useState([]);
