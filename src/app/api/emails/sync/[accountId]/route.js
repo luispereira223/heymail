@@ -1,3 +1,4 @@
+// src/app/api/emails/sync/[accountId]/route.js
 import { NextResponse } from 'next/server';
 import { auth } from '@/app/api/auth/[...nextauth]/route';
 import { initializeDatabase, decryptPassword, createUniqueEmailId } from '@/lib/database';
@@ -107,6 +108,23 @@ function getThreadKey(email) {
     : "no-subject";
 
   return `subject:${normalizedSubject}`;
+}
+
+// Helper function to safely convert values for SQLite
+function safeSqliteValue(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value === 'boolean') {
+    return value ? 1 : 0;
+  }
+  if (typeof value === 'object' && value instanceof Date) {
+    return value.toISOString();
+  }
+  if (typeof value === 'object') {
+    return JSON.stringify(value);
+  }
+  return value;
 }
 
 // POST - Start email sync
@@ -262,6 +280,7 @@ export async function PATCH(request, { params }) {
 async function syncEmailsInBackground(account, userId) {
   let db;
   let client;
+  let isClientConnected = false;
 
   try {
     console.log(`Starting sync for account: ${account.email}`);
@@ -281,10 +300,11 @@ async function syncEmailsInBackground(account, userId) {
     });
 
     await client.connect();
+    isClientConnected = true;
+    
     const mailbox = await client.mailboxOpen('INBOX');
 
     if (mailbox.exists === 0) {
-      await client.logout();
       console.log('No emails found in mailbox');
       
       // Update account status
@@ -295,6 +315,12 @@ async function syncEmailsInBackground(account, userId) {
         WHERE id = ?
       `).run(account.id);
       db.close();
+      
+      // Close connection properly
+      if (isClientConnected) {
+        await client.logout();
+        isClientConnected = false;
+      }
       return;
     }
 
@@ -369,17 +395,17 @@ async function syncEmailsInBackground(account, userId) {
           account_id: account.id,
           uid: message.uid,
           unique_id: createUniqueEmailId(account.id, message.uid),
-          subject: parsed.subject,
-          from_sender: parsed.from?.text || "N/A",
+          subject: parsed.subject || null,
+          from_sender: parsed.from?.text || null,
           date: parsed.date ? parsed.date.toISOString() : null,
           internal_date: message.internalDate ? message.internalDate.toISOString() : null,
-          html: parsed.html,
-          text_content: parsed.text,
+          html: parsed.html || null,
+          text_content: parsed.text || null,
           is_read: isRead,
           is_reply: isReply,
-          message_id: parsed.messageId,
-          in_reply_to: parsed.inReplyTo,
-          thread_id: message.threadId,
+          message_id: parsed.messageId || null,
+          in_reply_to: parsed.inReplyTo || null,
+          thread_id: message.threadId || null,
           has_attachments: hasAttachments,
           attachment_count: attachmentCount,
           attachments: attachments,
@@ -392,7 +418,11 @@ async function syncEmailsInBackground(account, userId) {
       }
     }
 
-    await client.logout();
+    // Close IMAP connection after fetching
+    if (isClientConnected) {
+      await client.logout();
+      isClientConnected = false;
+    }
 
     // Sort emails by date for proper thread processing
     emails.sort((a, b) => new Date(a.internal_date || 0) - new Date(b.internal_date || 0));
@@ -440,26 +470,27 @@ async function syncEmailsInBackground(account, userId) {
     db.exec('BEGIN TRANSACTION');
     try {
       for (const email of emailsWithThreadInfo) {
+        // Use safeSqliteValue to ensure all values are SQLite-compatible
         const result = insertEmailStmt.run(
-          email.account_id,
-          email.uid,
-          email.unique_id,
-          email.subject,
-          email.from_sender,
-          email.date,
-          email.internal_date,
-          email.html,
-          email.text_content,
-          email.is_read ? 1 : 0,
-          email.is_reply ? 1 : 0,
-          email.is_first_in_thread ? 1 : 0,
-          email.message_id,
-          email.in_reply_to,
-          email.thread_id,
-          email.thread_position,
-          email.reply_count,
-          email.has_attachments ? 1 : 0,
-          email.attachment_count
+          safeSqliteValue(email.account_id),
+          safeSqliteValue(email.uid),
+          safeSqliteValue(email.unique_id),
+          safeSqliteValue(email.subject),
+          safeSqliteValue(email.from_sender),
+          safeSqliteValue(email.date),
+          safeSqliteValue(email.internal_date),
+          safeSqliteValue(email.html),
+          safeSqliteValue(email.text_content),
+          safeSqliteValue(email.is_read),
+          safeSqliteValue(email.is_reply),
+          safeSqliteValue(email.is_first_in_thread),
+          safeSqliteValue(email.message_id),
+          safeSqliteValue(email.in_reply_to),
+          safeSqliteValue(email.thread_id),
+          safeSqliteValue(email.thread_position),
+          safeSqliteValue(email.reply_count),
+          safeSqliteValue(email.has_attachments),
+          safeSqliteValue(email.attachment_count)
         );
 
         // Insert attachments
@@ -467,11 +498,11 @@ async function syncEmailsInBackground(account, userId) {
           for (const attachment of email.attachments) {
             insertAttachmentStmt.run(
               result.lastInsertRowid,
-              attachment.part,
-              attachment.filename,
-              attachment.contentType,
-              attachment.size,
-              attachment.encoding
+              safeSqliteValue(attachment.part),
+              safeSqliteValue(attachment.filename),
+              safeSqliteValue(attachment.contentType),
+              safeSqliteValue(attachment.size),
+              safeSqliteValue(attachment.encoding)
             );
           }
         }
@@ -515,11 +546,16 @@ async function syncEmailsInBackground(account, userId) {
       console.error('Error updating sync status:', dbError);
     }
 
-    // Clean up connections
+    // Clean up IMAP connection only if it's still connected
     try {
-      if (client) await client.logout();
+      if (client && isClientConnected) {
+        await client.logout();
+      }
     } catch (logoutErr) {
-      console.error('Error during logout:', logoutErr);
+      // Only log if it's not a "connection not available" error
+      if (logoutErr.code !== 'NoConnection') {
+        console.error('Error during logout:', logoutErr);
+      }
     }
   }
 }
