@@ -93,23 +93,6 @@ function extractAttachmentInfo(bodyStructure) {
   return attachments;
 }
 
-// Helper function to generate thread key
-function getThreadKey(email) {
-  if (email.references && email.references.length > 0) {
-    return email.references[0];
-  }
-
-  if (email.inReplyTo) {
-    return email.inReplyTo;
-  }
-
-  const normalizedSubject = email.subject
-    ? email.subject.replace(/^(Re:|Fwd:|Fw:)\s*/gi, "").trim()
-    : "no-subject";
-
-  return `subject:${normalizedSubject}`;
-}
-
 // Helper function to safely convert values for SQLite
 function safeSqliteValue(value) {
   if (value === undefined || value === null) {
@@ -125,6 +108,185 @@ function safeSqliteValue(value) {
     return JSON.stringify(value);
   }
   return value;
+}
+
+// Helper function to save a batch of emails to database
+async function saveBatchToDatabase(emailBatch, accountId) {
+  const db = initializeDatabase();
+  
+  try {
+    const insertEmailStmt = db.prepare(`
+      INSERT INTO emails (
+        account_id, uid, unique_id, subject, from_sender, date, internal_date,
+        html, text_content, is_read, is_reply, is_first_in_thread,
+        message_id, in_reply_to, thread_id, thread_position, reply_count,
+        has_attachments, attachment_count
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const insertAttachmentStmt = db.prepare(`
+      INSERT INTO attachments (email_id, part, filename, content_type, size, encoding)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+
+    db.exec('BEGIN TRANSACTION');
+    
+    for (const email of emailBatch) {
+      const result = insertEmailStmt.run(
+        safeSqliteValue(email.account_id),
+        safeSqliteValue(email.uid),
+        safeSqliteValue(email.unique_id),
+        safeSqliteValue(email.subject),
+        safeSqliteValue(email.from_sender),
+        safeSqliteValue(email.date),
+        safeSqliteValue(email.internal_date),
+        safeSqliteValue(email.html),
+        safeSqliteValue(email.text_content),
+        safeSqliteValue(email.is_read),
+        safeSqliteValue(email.is_reply),
+        safeSqliteValue(email.is_first_in_thread),
+        safeSqliteValue(email.message_id),
+        safeSqliteValue(email.in_reply_to),
+        safeSqliteValue(email.thread_id),
+        safeSqliteValue(email.thread_position),
+        safeSqliteValue(email.reply_count),
+        safeSqliteValue(email.has_attachments),
+        safeSqliteValue(email.attachment_count)
+      );
+
+      // Insert attachments
+      if (email.attachments && email.attachments.length > 0) {
+        for (const attachment of email.attachments) {
+          insertAttachmentStmt.run(
+            result.lastInsertRowid,
+            safeSqliteValue(attachment.part),
+            safeSqliteValue(attachment.filename),
+            safeSqliteValue(attachment.contentType),
+            safeSqliteValue(attachment.size),
+            safeSqliteValue(attachment.encoding)
+          );
+        }
+      }
+    }
+    
+    db.exec('COMMIT');
+    console.log(`✓ Saved batch of ${emailBatch.length} emails to database`);
+    
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  } finally {
+    db.close(); // Always close the connection
+  }
+}
+
+// Helper function to update sync progress
+async function updateSyncProgress(accountId, processedCount, totalEmails, currentSubject) {
+  const db = initializeDatabase();
+  
+  try {
+    db.prepare(`
+      UPDATE sync_progress 
+      SET processed_emails = ?, current_email_subject = ?, last_update = CURRENT_TIMESTAMP
+      WHERE account_id = ?
+    `).run(processedCount, currentSubject || 'No Subject', accountId);
+    
+    db.prepare(`
+      UPDATE email_accounts 
+      SET synced_emails = ?, sync_progress = ?
+      WHERE id = ?
+    `).run(processedCount, Math.round((processedCount / totalEmails) * 100), accountId);
+    
+  } finally {
+    db.close();
+  }
+}
+
+// MEMORY FIX: Threading analysis using database queries instead of in-memory processing
+async function analyzeThreadingInDatabase(accountId) {
+  const db = initializeDatabase();
+  
+  try {
+    // Get all emails for this account, ordered by date
+    const emails = db.prepare(`
+      SELECT id, message_id, in_reply_to, thread_id, subject, internal_date
+      FROM emails 
+      WHERE account_id = ? 
+      ORDER BY internal_date ASC
+    `).all(accountId);
+
+    // Build threading relationships
+    const messageIdMap = new Map(); // message_id -> email
+    const threadGroups = new Map(); // thread_key -> array of email IDs
+    
+    // First pass: build message ID index
+    emails.forEach(email => {
+      if (email.message_id) {
+        messageIdMap.set(email.message_id, email);
+      }
+    });
+
+    // Second pass: group emails by thread
+    emails.forEach(email => {
+      let threadKey;
+      
+      // Use Gmail thread ID if available
+      if (email.thread_id) {
+        threadKey = email.thread_id;
+      }
+      // Check if this is a reply to an existing message
+      else if (email.in_reply_to && messageIdMap.has(email.in_reply_to)) {
+        const parentEmail = messageIdMap.get(email.in_reply_to);
+        threadKey = `reply:${parentEmail.message_id}`;
+      }
+      // Group by normalized subject
+      else {
+        const normalizedSubject = email.subject 
+          ? email.subject.replace(/^(Re:|Fwd:|Fw:)\s*/gi, "").trim()
+          : "no-subject";
+        threadKey = `subject:${normalizedSubject}`;
+      }
+
+      if (!threadGroups.has(threadKey)) {
+        threadGroups.set(threadKey, []);
+      }
+      threadGroups.get(threadKey).push(email);
+    });
+
+    // Third pass: update threading information in database
+    const updateThreadingStmt = db.prepare(`
+      UPDATE emails 
+      SET reply_count = ?, thread_position = ?, is_first_in_thread = ?
+      WHERE id = ?
+    `);
+
+    db.exec('BEGIN TRANSACTION');
+    
+    threadGroups.forEach((threadEmails) => {
+      const replyCount = threadEmails.length - 1;
+      
+      threadEmails.forEach((email, index) => {
+        const threadPosition = index + 1;
+        const isFirstInThread = threadPosition === 1;
+        
+        updateThreadingStmt.run(
+          replyCount,
+          threadPosition,
+          isFirstInThread ? 1 : 0,
+          email.id
+        );
+      });
+    });
+
+    db.exec('COMMIT');
+    console.log(`✓ Threading analysis completed for ${emails.length} emails`);
+    
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  } finally {
+    db.close();
+  }
 }
 
 // POST - Start email sync
@@ -276,7 +438,7 @@ export async function PATCH(request, { params }) {
   }
 }
 
-// Background sync function
+// MEMORY OPTIMIZED Background sync function
 async function syncEmailsInBackground(account, userId) {
   let db;
   let client;
@@ -316,7 +478,6 @@ async function syncEmailsInBackground(account, userId) {
       `).run(account.id);
       db.close();
       
-      // Close connection properly
       if (isClientConnected) {
         await client.logout();
         isClientConnected = false;
@@ -346,10 +507,12 @@ async function syncEmailsInBackground(account, userId) {
 
     db.close();
 
-    const emails = [];
+    // MEMORY FIX: Process emails in batches instead of storing all in memory
+    const BATCH_SIZE = 50;
+    let emailBatch = [];
     let processedCount = 0;
 
-    // Fetch emails
+    // Fetch emails and process in batches
     for await (let message of client.fetch("1:*", {
       source: true,
       envelope: true,
@@ -364,26 +527,6 @@ async function syncEmailsInBackground(account, userId) {
         // Parse the email
         const parsed = await simpleParser(message.source);
         
-        // Update progress every 10 emails
-        if (processedCount % 10 === 0) {
-          db = initializeDatabase();
-          db.prepare(`
-            UPDATE sync_progress 
-            SET processed_emails = ?, current_email_subject = ?, last_update = CURRENT_TIMESTAMP
-            WHERE account_id = ?
-          `).run(processedCount, parsed.subject || 'No Subject', account.id);
-          
-          db.prepare(`
-            UPDATE email_accounts 
-            SET synced_emails = ?, sync_progress = ?
-            WHERE id = ?
-          `).run(processedCount, Math.round((processedCount / mailbox.exists) * 100), account.id);
-          
-          db.close();
-          
-          console.log(`Processed ${processedCount}/${mailbox.exists} emails`);
-        }
-
         // Check email properties
         const isRead = message.flags.has("\\Seen");
         const hasAttachments = checkForAttachments(message.bodyStructure);
@@ -409,124 +552,66 @@ async function syncEmailsInBackground(account, userId) {
           has_attachments: hasAttachments,
           attachment_count: attachmentCount,
           attachments: attachments,
+          // Initialize threading fields - will be calculated later
+          reply_count: 0,
+          thread_position: 1,
+          is_first_in_thread: true
         };
 
-        emails.push(emailData);
+        emailBatch.push(emailData);
+
+        // MEMORY FIX: Save batch to database when it reaches BATCH_SIZE
+        if (emailBatch.length >= BATCH_SIZE) {
+          await saveBatchToDatabase(emailBatch, account.id);
+          emailBatch = []; // Clear the batch from memory!
+          
+          // Force garbage collection hint (Node.js with --expose-gc flag)
+          if (global.gc) {
+            global.gc();
+          }
+        }
+
+        // Update progress every 10 emails
+        if (processedCount % 10 === 0) {
+          await updateSyncProgress(account.id, processedCount, mailbox.exists, parsed.subject);
+          console.log(`Processed ${processedCount}/${mailbox.exists} emails`);
+        }
+
       } catch (emailError) {
         console.error(`Error processing email UID ${message.uid}:`, emailError);
         // Continue with next email
       }
     }
 
-    // Close IMAP connection after fetching
+    // MEMORY FIX: Process remaining emails in the final batch
+    if (emailBatch.length > 0) {
+      await saveBatchToDatabase(emailBatch, account.id);
+      emailBatch = null; // Explicitly clear
+    }
+
+    // Close IMAP connection
     if (isClientConnected) {
       await client.logout();
       isClientConnected = false;
     }
 
-    // Sort emails by date for proper thread processing
-    emails.sort((a, b) => new Date(a.internal_date || 0) - new Date(b.internal_date || 0));
-
-    // Process threading
-    const threadsMap = new Map();
-    const emailsWithThreadInfo = emails.map((email) => {
-      const threadKey = email.thread_id || getThreadKey(email);
-
-      if (!threadsMap.has(threadKey)) {
-        threadsMap.set(threadKey, []);
-      }
-      threadsMap.get(threadKey).push(email);
-
-      return email;
-    });
-
-    // Add thread information
-    emailsWithThreadInfo.forEach((email) => {
-      const threadKey = email.thread_id || getThreadKey(email);
-      const threadEmails = threadsMap.get(threadKey);
-
-      email.reply_count = threadEmails.length - 1;
-      email.thread_position = threadEmails.findIndex((e) => e.uid === email.uid) + 1;
-      email.is_first_in_thread = email.thread_position === 1;
-    });
-
-    // Save to database
-    db = initializeDatabase();
-    
-    const insertEmailStmt = db.prepare(`
-      INSERT INTO emails (
-        account_id, uid, unique_id, subject, from_sender, date, internal_date,
-        html, text_content, is_read, is_reply, is_first_in_thread,
-        message_id, in_reply_to, thread_id, thread_position, reply_count,
-        has_attachments, attachment_count
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
-
-    const insertAttachmentStmt = db.prepare(`
-      INSERT INTO attachments (email_id, part, filename, content_type, size, encoding)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `);
-
-    db.exec('BEGIN TRANSACTION');
-    try {
-      for (const email of emailsWithThreadInfo) {
-        // Use safeSqliteValue to ensure all values are SQLite-compatible
-        const result = insertEmailStmt.run(
-          safeSqliteValue(email.account_id),
-          safeSqliteValue(email.uid),
-          safeSqliteValue(email.unique_id),
-          safeSqliteValue(email.subject),
-          safeSqliteValue(email.from_sender),
-          safeSqliteValue(email.date),
-          safeSqliteValue(email.internal_date),
-          safeSqliteValue(email.html),
-          safeSqliteValue(email.text_content),
-          safeSqliteValue(email.is_read),
-          safeSqliteValue(email.is_reply),
-          safeSqliteValue(email.is_first_in_thread),
-          safeSqliteValue(email.message_id),
-          safeSqliteValue(email.in_reply_to),
-          safeSqliteValue(email.thread_id),
-          safeSqliteValue(email.thread_position),
-          safeSqliteValue(email.reply_count),
-          safeSqliteValue(email.has_attachments),
-          safeSqliteValue(email.attachment_count)
-        );
-
-        // Insert attachments
-        if (email.attachments && email.attachments.length > 0) {
-          for (const attachment of email.attachments) {
-            insertAttachmentStmt.run(
-              result.lastInsertRowid,
-              safeSqliteValue(attachment.part),
-              safeSqliteValue(attachment.filename),
-              safeSqliteValue(attachment.contentType),
-              safeSqliteValue(attachment.size),
-              safeSqliteValue(attachment.encoding)
-            );
-          }
-        }
-      }
-      db.exec('COMMIT');
-      console.log('✓ Database transaction completed successfully');
-    } catch (dbError) {
-      db.exec('ROLLBACK');
-      throw dbError;
-    }
+    // MEMORY FIX: Now do threading analysis on database, not in memory
+    console.log('Starting threading analysis...');
+    await analyzeThreadingInDatabase(account.id);
 
     // Update final status
+    db = initializeDatabase();
     db.prepare(`
       UPDATE email_accounts 
       SET sync_status = 'completed', synced_emails = ?, last_sync = CURRENT_TIMESTAMP, sync_error = NULL
       WHERE id = ?
-    `).run(emails.length, account.id);
+    `).run(processedCount, account.id);
 
     // Clean up progress
     db.prepare('DELETE FROM sync_progress WHERE account_id = ?').run(account.id);
-
     db.close();
 
-    console.log(`✓ Sync completed for ${account.email}: ${emails.length} emails processed`);
+    console.log(`✓ Sync completed for ${account.email}: ${processedCount} emails processed`);
 
   } catch (error) {
     console.error('❌ Sync error:', error);
@@ -546,13 +631,12 @@ async function syncEmailsInBackground(account, userId) {
       console.error('Error updating sync status:', dbError);
     }
 
-    // Clean up IMAP connection only if it's still connected
+    // Clean up IMAP connection
     try {
       if (client && isClientConnected) {
         await client.logout();
       }
     } catch (logoutErr) {
-      // Only log if it's not a "connection not available" error
       if (logoutErr.code !== 'NoConnection') {
         console.error('Error during logout:', logoutErr);
       }

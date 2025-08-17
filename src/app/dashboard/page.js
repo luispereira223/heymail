@@ -34,7 +34,7 @@ export default function Dashboard() {
   // Fetch emails from all accounts
   const fetchEmails = async () => {
     try {
-      const response = await fetch("/api/emails?limit=500", {
+      const response = await fetch("/api/emails?limit=5000", {
         method: "GET",
         headers: { "Content-Type": "application/json" },
       });
